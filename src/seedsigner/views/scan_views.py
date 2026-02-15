@@ -9,6 +9,7 @@ from seedsigner.gui.screens.screen import RET_CODE__BACK_BUTTON, ButtonListScree
 from seedsigner.gui.screens.scan_screens import ScanEncryptedQRScreen, ScanTypeEncryptionKeyScreen, ScanReviewEncryptionKeyScreen
 from seedsigner.gui.screens import LargeIconStatusScreen
 from seedsigner.models.decode_qr import DecodeQR, DecodeQRStatus
+from seedsigner.models.qr_type import QRType
 from seedsigner.models.seed import Seed, XprvSeed, InvalidSeedException
 
 from gettext import gettext as _
@@ -69,6 +70,31 @@ class ScanView(View):
 
         # Handle the results
         if self.decoder.is_complete:
+            if self.decoder.qr_type == QRType.SEED__COMPACTSEEDQR and self.decoder.has_ambiguous_compact_encrypted_seedqr:
+                COMPACT = ButtonOption("Process as CompactQR")
+                ENCRYPTED = ButtonOption("Process as EncryptedQR")
+                CANCEL = ButtonOption("Cancel")
+                button_data = [COMPACT, ENCRYPTED, CANCEL]
+
+                selected_menu_num = self.run_screen(
+                    WarningScreen,
+                    title="Ambiguous QR",
+                    status_headline=None,
+                    text=_("QR matches CompactQR and EncryptedQR."),
+                    show_back_button=False,
+                    button_data=button_data,
+                )
+
+                selected_option = button_data[selected_menu_num]
+                if selected_option == ENCRYPTED:
+                    rt = self.decoder.use_ambiguous_compact_seedqr_as_encryptedqr()
+                    if rt != DecodeQRStatus.COMPLETE:
+                        return Destination(ScanInvalidQRTypeView)
+
+                elif selected_option == CANCEL:
+                    self.controller.storage2.clear_encryptedqr()
+                    return Destination(MainMenuView)
+
             if not self.is_valid_qr_type:
                 # We recognized the QR type but it was not the type expected for the
                 # current flow.

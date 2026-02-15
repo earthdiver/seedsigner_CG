@@ -45,3 +45,9 @@ class TestSettingsDefinition(BaseTest):
     def test_tapsigner_backup_default_disabled(self):
         defaults = SettingsDefinition.get_defaults()
         assert defaults[SettingsConstants.SETTING__TAPSIGNER_BACKUP] == SettingsConstants.OPTION__DISABLED
+
+
+    def test_encryption_mode_choices_exclude_v1(self):
+        assert SettingsConstants.ENCRYPTION_MODE_ECBV1 not in SettingsConstants.ALL_ENCRYPTION_MODES
+        assert SettingsConstants.ENCRYPTION_MODE_CBCV1 not in SettingsConstants.ALL_ENCRYPTION_MODES
+

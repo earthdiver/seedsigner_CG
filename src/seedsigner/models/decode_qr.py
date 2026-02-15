@@ -50,6 +50,8 @@ class DecodeQR:
         self.is_encryptionkey = is_encryptionkey
         self.is_text = is_text
         self.is_nonUTF8 = False
+        self.ambiguous_encryptedqr = None
+        self.ambiguous_encryptedqr_segment = None
 
 
     def add_image(self, image):
@@ -71,7 +73,7 @@ class DecodeQR:
         elif self.is_text:
             qr_type = QRType.TEXT
         else:
-            qr_type = DecodeQR.detect_segment_type(data, wordlist_language_code=self.wordlist_language_code)
+            qr_type = self.detect_segment_type(data)
 
         if self.qr_type == None:
             self.qr_type = qr_type
@@ -420,6 +422,52 @@ class DecodeQR:
         return self.qr_type == QRType.SEED__ENCRYPTEDQR
 
 
+    @property
+    def has_ambiguous_compact_encrypted_seedqr(self) -> bool:
+        return self.ambiguous_encryptedqr is not None and self.ambiguous_encryptedqr_segment is not None
+
+
+    def use_ambiguous_compact_seedqr_as_encryptedqr(self) -> DecodeQRStatus:
+        if not self.has_ambiguous_compact_encrypted_seedqr:
+            return DecodeQRStatus.INVALID
+
+        from seedsigner.controller import Controller
+        controller = Controller.get_instance()
+        controller.storage2.set_encryptedqr(self.ambiguous_encryptedqr)
+
+        self.qr_type = QRType.SEED__ENCRYPTEDQR
+        self.decoder = EncryptedQrDecoder()
+        rt = self.decoder.add(self.ambiguous_encryptedqr_segment, self.qr_type)
+        if rt == DecodeQRStatus.COMPLETE:
+            self.complete = True
+        return rt
+
+
+    @staticmethod
+    def parse_encryptedqr_public_data(s):
+        from seedsigner.models.encryption import EncryptedQRCode
+        from seedsigner.helpers.base43 import base43_decode
+
+        encrypted_qr = EncryptedQRCode()
+        public_data = None
+
+        try:  # Try to decode base43 data
+            if isinstance(s, bytes):
+                s = s.decode('utf-8')
+            data_bytes = base43_decode(s)
+            public_data = encrypted_qr.public_data(data_bytes)
+        except Exception:
+            pass
+
+        if not public_data:  # Failed to decode and parse base43
+            public_data = encrypted_qr.public_data(s)
+
+        if not public_data:
+            return None, None
+
+        return encrypted_qr, public_data
+
+
     @staticmethod
     def extract_qr_data(image, is_binary:bool = False) -> str | None:
         if image is None:
@@ -436,8 +484,7 @@ class DecodeQR:
             return barcode.data
 
 
-    @staticmethod
-    def detect_segment_type(s, wordlist_language_code=None):
+    def detect_segment_type(self, s):
         # print("-------------- DecodeQR.detect_segment_type --------------")
         # print(type(s))
         # print(len(s))
@@ -507,7 +554,7 @@ class DecodeQR:
 
             # Seed
             # create 4 letter wordlist only if not PSBT (performance gain)
-            wordlist = Seed.get_wordlist(wordlist_language_code)
+            wordlist = Seed.get_wordlist(self.wordlist_language_code)
             try:
                 _4LETTER_WORDLIST = [word[:4].strip() for word in wordlist]
             except:
@@ -579,26 +626,20 @@ class DecodeQR:
                     bitstream += bin(b).lstrip('0b').zfill(8)
                 # print(bitstream)
 
+                encrypted_qr, public_data = DecodeQR.parse_encryptedqr_public_data(s)
+                if encrypted_qr and public_data:
+                    from seedsigner.models.encryptedqr import EncryptedQR
+                    self.ambiguous_encryptedqr = EncryptedQR(encrypted_qr=encrypted_qr, public_data=public_data)
+                    self.ambiguous_encryptedqr_segment = s
+
                 return QRType.SEED__COMPACTSEEDQR
             except Exception as e:
                 # Couldn't extract byte data; assume it's not a byte format
                 pass
 
         else:
-            from seedsigner.models.encryption import EncryptedQRCode
-            from seedsigner.helpers.base43 import base43_decode
-            encrypted_qr = EncryptedQRCode()
-            public_data = None
-            try:  # Try to decode base43 data
-                if isinstance(s, bytes):
-                    s = s.decode('utf-8')
-                data_bytes = base43_decode(s)
-                public_data = encrypted_qr.public_data(data_bytes)
-            except:
-                pass
-            if not public_data:  # Failed to decode and parse base43
-                public_data = encrypted_qr.public_data(s)
-            if public_data:
+            encrypted_qr, public_data = DecodeQR.parse_encryptedqr_public_data(s)
+            if encrypted_qr and public_data:
                 from seedsigner.models.encryptedqr import EncryptedQR
                 encryptedqr = EncryptedQR(encrypted_qr=encrypted_qr, public_data=public_data)
                 from seedsigner.controller import Controller
