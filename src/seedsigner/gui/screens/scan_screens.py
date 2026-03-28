@@ -317,6 +317,23 @@ class ScanEncryptedQRScreen(ButtonListScreen):
         ))
 
 
+@dataclass
+class ScanAmbiguousSeedQRScreen(ButtonListScreen):
+    message: str = None
+
+    def __post_init__(self):
+        self.title = _("Choose Format")
+        self.show_back_button = False
+        self.is_bottom_list = True
+        super().__post_init__()
+
+        self.components.append(TextArea(
+            text=self.message,
+            screen_y=self.top_nav.height,
+            is_text_centered=True,
+        ))
+
+
 
 @dataclass
 class ScanTypeEncryptionKeyScreen(BaseTopNavScreen):

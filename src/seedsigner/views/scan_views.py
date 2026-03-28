@@ -6,9 +6,15 @@ import subprocess
 #from embit.descriptor import Descriptor
 
 from seedsigner.gui.screens.screen import RET_CODE__BACK_BUTTON, ButtonListScreen, WarningScreen, DireWarningScreen
-from seedsigner.gui.screens.scan_screens import ScanEncryptedQRScreen, ScanTypeEncryptionKeyScreen, ScanReviewEncryptionKeyScreen
+from seedsigner.gui.screens.scan_screens import (
+    ScanAmbiguousSeedQRScreen,
+    ScanEncryptedQRScreen,
+    ScanTypeEncryptionKeyScreen,
+    ScanReviewEncryptionKeyScreen,
+)
 from seedsigner.gui.screens import LargeIconStatusScreen
 from seedsigner.models.decode_qr import DecodeQR, DecodeQRStatus
+from seedsigner.models.qr_type import QRType
 from seedsigner.models.seed import Seed, XprvSeed, InvalidSeedException
 
 from gettext import gettext as _
@@ -22,6 +28,43 @@ from seedsigner.hardware.microsd import MicroSD
 
 logger = logging.getLogger(__name__)
 
+
+def finalize_mnemonic_seed(
+    controller,
+    settings,
+    seed_phrase: list[str],
+    wordlist_language_code: str,
+    skip_current_view: bool = False,
+) -> Destination:
+    controller.storage.set_pending_seed(
+        Seed(mnemonic=seed_phrase, wordlist_language_code=wordlist_language_code)
+    )
+    if settings.get_value(SettingsConstants.SETTING__PASSPHRASE) == SettingsConstants.OPTION__REQUIRED:
+        from seedsigner.views.seed_views import SeedAddPassphraseView
+        return Destination(SeedAddPassphraseView, skip_current_view=skip_current_view)
+
+    from .seed_views import SeedFinalizeView
+    return Destination(SeedFinalizeView, skip_current_view=skip_current_view)
+
+
+def finalize_xprv_seed(controller, candidate: str, skip_current_view: bool = False) -> Destination:
+    from embit import bip32
+
+    try:
+        hdkey = bip32.HDKey.from_string(candidate)
+    except Exception:
+        return Destination(ScanInvalidQRTypeView)
+
+    if not hdkey.is_private:
+        return Destination(ScanInvalidQRTypeView)
+
+    try:
+        controller.storage.set_pending_seed(XprvSeed(candidate))
+    except InvalidSeedException:
+        return Destination(ScanInvalidQRTypeView)
+
+    from .seed_views import SeedFinalizeView
+    return Destination(SeedFinalizeView, skip_current_view=skip_current_view)
 
 
 class ScanView(View):
@@ -50,6 +93,17 @@ class ScanView(View):
     @property
     def is_valid_qr_type(self):
         return True
+
+    def _finalize_mnemonic_seed(self, seed_phrase: list[str]) -> Destination:
+        return finalize_mnemonic_seed(
+            controller=self.controller,
+            settings=self.settings,
+            seed_phrase=seed_phrase,
+            wordlist_language_code=self.wordlist_language_code,
+        )
+
+    def _finalize_xprv_seed(self, xprv: str) -> Destination:
+        return finalize_xprv_seed(controller=self.controller, candidate=xprv)
 
 
     def run(self):
@@ -90,18 +144,7 @@ class ScanView(View):
                     # seed is not valid, Exit if not valid with message
                     return Destination(NotYetImplementedView)
                 else:
-                    # Found a valid mnemonic seed! All new seeds should be considered
-                    #   pending (might set a passphrase, SeedXOR, etc) until finalized.
-                    from seedsigner.models.seed import Seed
-                    from .seed_views import SeedFinalizeView
-                    self.controller.storage.set_pending_seed(
-                        Seed(mnemonic=seed_mnemonic, wordlist_language_code=self.wordlist_language_code)
-                    )
-                    if self.settings.get_value(SettingsConstants.SETTING__PASSPHRASE) == SettingsConstants.OPTION__REQUIRED:
-                        from seedsigner.views.seed_views import SeedAddPassphraseView
-                        return Destination(SeedAddPassphraseView)
-                    else:
-                        return Destination(SeedFinalizeView)
+                    return self._finalize_mnemonic_seed(seed_mnemonic)
 
             elif self.decoder.is_slip39_share:
                 share = self.decoder.get_slip39_share()
@@ -113,16 +156,18 @@ class ScanView(View):
                 return Destination(SeedSlip39MoreSharesView)
 
             elif self.decoder.is_xprv:
-                from .seed_views import SeedFinalizeView
+                return self._finalize_xprv_seed(self.decoder.get_xprv())
 
-                try:
-                    self.controller.storage.set_pending_seed(
-                        XprvSeed(self.decoder.get_xprv())
-                    )
-                except InvalidSeedException:
-                    return Destination(ScanInvalidQRTypeView)
-
-                return Destination(SeedFinalizeView)
+            elif self.decoder.is_ambiguous_seedqr:
+                return Destination(
+                    ScanAmbiguousSeedQRPromptView,
+                    view_args=dict(
+                        segment=self.decoder.get_ambiguous_segment(),
+                        candidate_types=self.decoder.get_ambiguous_candidate_types(),
+                        public_data=self.decoder.get_ambiguous_public_data(),
+                    ),
+                    skip_current_view=True,
+                )
             
             elif self.decoder.is_psbt:
                 from seedsigner.views.psbt_views import PSBTSelectSeedView
@@ -309,7 +354,7 @@ class ScanSeedQRView(ScanView):
 
     @property
     def is_valid_qr_type(self):
-        return self.decoder.is_seed or self.decoder.is_encrypted_seedqr or self.decoder.is_xprv
+        return self.decoder.is_seed or self.decoder.is_encrypted_seedqr or self.decoder.is_xprv or self.decoder.is_ambiguous_seedqr
 
 
 class ScanSlip39ShareQRView(ScanView):
@@ -444,6 +489,66 @@ class ScanXpubAddressView(ScanAddressView):
 
         return destination
 
+
+
+class ScanAmbiguousSeedQRPromptView(ScanView):
+    COMPACT = ButtonOption("CompactSeedQR")
+    ENCRYPTED = ButtonOption("EncryptedQR")
+    XPRV = ButtonOption("xprv")
+    CANCEL = ButtonOption("Cancel")
+
+    def __init__(self, segment: bytes | str, candidate_types: list[str], public_data: str = None):
+        super().__init__()
+        self.segment = segment
+        self.candidate_types = candidate_types
+        self.public_data = public_data
+
+    def run(self):
+        segment_bytes = self.segment if isinstance(self.segment, bytes) else self.segment.encode("utf-8")
+        analysis = DecodeQR.analyze_seed_payload(segment_bytes)
+
+        button_data = []
+        if QRType.SEED__COMPACTSEEDQR in self.candidate_types:
+            button_data.append(self.COMPACT)
+        if QRType.SEED__ENCRYPTEDQR in self.candidate_types:
+            button_data.append(self.ENCRYPTED)
+        if QRType.SEED__XPRV in self.candidate_types:
+            button_data.append(self.XPRV)
+        button_data.append(self.CANCEL)
+
+        selected_menu_num = self.run_screen(
+            ScanAmbiguousSeedQRScreen,
+            message=_("Data matches multiple\nseed formats."),
+            button_data=button_data,
+        )
+
+        selected_option = button_data[selected_menu_num]
+
+        if selected_option == self.COMPACT:
+            from embit import bip39
+            seed_phrase = bip39.mnemonic_from_bytes(segment_bytes).split()
+            return finalize_mnemonic_seed(
+                controller=self.controller,
+                settings=self.settings,
+                seed_phrase=seed_phrase,
+                wordlist_language_code=self.wordlist_language_code,
+            )
+
+        if selected_option == self.ENCRYPTED:
+            if analysis.encrypted_qr and analysis.public_data:
+                DecodeQR._store_encrypted_qr_candidate(analysis.encrypted_qr, analysis.public_data)
+                return Destination(ScanEncryptedQREncryptionKeyView, skip_current_view=True)
+            return Destination(ScanInvalidQRTypeView)
+
+        if selected_option == self.XPRV:
+            candidate = segment_bytes.decode("utf-8").strip()
+            return finalize_xprv_seed(
+                controller=self.controller,
+                candidate=candidate,
+            )
+
+        self.controller.storage2.clear_encryptedqr()
+        return Destination(MainMenuView)
 
 
 class ScanEncryptedQREncryptionKeyView(View):
@@ -634,46 +739,83 @@ class ScanDecryptEncryptedQRView(View):
         self.encrypted_data: bytes = encrypted_data
         self.wordlist_language_code = self.settings.get_value(SettingsConstants.SETTING__WORDLIST_LANGUAGE)
 
+    def _route_decrypted_payload(self, word_bytes: bytes) -> Destination:
+        from embit import bip39
+
+        analysis = DecodeQR.analyze_seed_payload(word_bytes)
+        resolved_qr_type = DecodeQR.resolve_seed_payload_type(analysis)
+
+        if resolved_qr_type == QRType.SEED__COMPACTSEEDQR:
+            seed_phrase = bip39.mnemonic_from_bytes(word_bytes).split()
+            return finalize_mnemonic_seed(
+                controller=self.controller,
+                settings=self.settings,
+                seed_phrase=seed_phrase,
+                wordlist_language_code=self.wordlist_language_code,
+                skip_current_view=True,
+            )
+
+        if resolved_qr_type == QRType.SEED__XPRV:
+            candidate = word_bytes.decode("utf-8").strip()
+            return finalize_xprv_seed(
+                controller=self.controller,
+                candidate=candidate,
+                skip_current_view=True,
+            )
+
+        if resolved_qr_type == QRType.SEED__ENCRYPTEDQR:
+            DecodeQR._store_encrypted_qr_candidate(analysis.encrypted_qr, analysis.public_data)
+            return Destination(ScanEncryptedQREncryptionKeyView, skip_current_view=True)
+
+        if resolved_qr_type == QRType.SEED__AMBIGUOUS:
+            return Destination(
+                ScanAmbiguousSeedQRPromptView,
+                view_args=dict(
+                    segment=word_bytes,
+                    candidate_types=analysis.candidate_types,
+                    public_data=analysis.public_data,
+                ),
+                skip_current_view=True,
+            )
+
+        return Destination(ScanInvalidQRTypeView)
+
 
     def run(self):
         from seedsigner.gui.screens.screen import LoadingScreenThread
         self.loading_screen = LoadingScreenThread(text="Processing...")
         self.loading_screen.start()
 
+        status = DecodeQRStatus.INVALID
+        word_bytes = None
+        encryptedqr = None
         try:
             from seedsigner.models.decode_qr import EncryptedQrDecoder
             from seedsigner.models.qr_type import QRType
             decoder = EncryptedQrDecoder()
-            status = decoder.add(self.encrypted_data, qr_type=QRType.SEED__ENCRYPTEDQR, encryption_key=self.encryption_key)
+            status = decoder.add(self.encrypted_data, qr_type=QRType.SEED__ENCRYPTEDQR)
+            if status == DecodeQRStatus.COMPLETE:
+                encryptedqr = self.controller.storage2.encryptedqr
+                if encryptedqr:
+                    word_bytes = encryptedqr.encrypted_qr.decrypt(self.encryption_key)
         finally:
             self.loading_screen.stop()
 
         if status == DecodeQRStatus.COMPLETE:
-            self.controller.storage2.clear_encryptedqr()
-            xprv = decoder.get_xprv()
-            if xprv:
-                self.controller.storage.set_pending_seed(XprvSeed(xprv))
-                from .seed_views import SeedFinalizeView
-                return Destination(SeedFinalizeView, skip_current_view=True)
-            else:
-                self.controller.storage.set_pending_seed(
-                    Seed(mnemonic=decoder.get_seed_phrase(), wordlist_language_code=self.wordlist_language_code)
-                )
-            if self.settings.get_value(SettingsConstants.SETTING__PASSPHRASE) == SettingsConstants.OPTION__REQUIRED:
-                from seedsigner.views.seed_views import SeedAddPassphraseView
-                return Destination(SeedAddPassphraseView, skip_current_view=True)
-            else:
-                from .seed_views import SeedFinalizeView
-                return Destination(SeedFinalizeView, skip_current_view=True)
+            if not encryptedqr:
+                return Destination(ScanInvalidQRTypeView)
 
-        elif status == DecodeQRStatus.WRONG_KEY:
-            WarningScreen(
-                title="Error",
-                show_back_button=False,
-                status_headline="decryption failure",
-                text="Review your encryption key.",
-            ).display()
-            return Destination(BackStackView)
+            if not word_bytes:
+                WarningScreen(
+                    title="Error",
+                    show_back_button=False,
+                    status_headline="decryption failure",
+                    text="Review your encryption key.",
+                ).display()
+                return Destination(BackStackView)
+
+            self.controller.storage2.clear_encryptedqr()
+            return self._route_decrypted_payload(word_bytes)
 
         else:
             WarningScreen(

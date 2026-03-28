@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from binascii import a2b_base64, b2a_base64
@@ -19,6 +20,14 @@ from seedsigner.models.seed import Seed
 from seedsigner.models.settings import SettingsConstants
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SeedPayloadAnalysis:
+    segment: bytes
+    candidate_types: list[str]
+    public_data: str | None = None
+    encrypted_qr: object | None = None
 
 
 
@@ -121,6 +130,9 @@ class DecodeQR:
             elif self.qr_type == QRType.SEED__ENCRYPTEDQR:
                 self.decoder = EncryptedQrDecoder()
 
+            elif self.qr_type == QRType.SEED__AMBIGUOUS:
+                self.decoder = AmbiguousSeedQrDecoder()
+
             elif self.qr_type == QRType.ENCRYPTION_KEY:
                 self.decoder = EncryptionKeyQrDecoder()
 
@@ -144,7 +156,7 @@ class DecodeQR:
             return DecodeQRStatus.INVALID
 
         # Process the binary formats first
-        if self.qr_type in [QRType.SEED__COMPACTSEEDQR, QRType.SEED__ENCRYPTEDQR]:
+        if self.qr_type in [QRType.SEED__COMPACTSEEDQR, QRType.SEED__ENCRYPTEDQR, QRType.SEED__AMBIGUOUS]:
             rt = self.decoder.add(data, self.qr_type)
             if rt == DecodeQRStatus.COMPLETE:
                 self.complete = True
@@ -275,6 +287,18 @@ class DecodeQR:
 
     def get_public_data(self):
         if self.is_encrypted_seedqr:
+            return self.decoder.get_public_data()
+
+    def get_ambiguous_segment(self):
+        if self.is_ambiguous_seedqr:
+            return self.decoder.get_segment()
+
+    def get_ambiguous_candidate_types(self):
+        if self.is_ambiguous_seedqr:
+            return self.decoder.get_candidate_types()
+
+    def get_ambiguous_public_data(self):
+        if self.is_ambiguous_seedqr:
             return self.decoder.get_public_data()
 
 
@@ -419,6 +443,10 @@ class DecodeQR:
     def is_encrypted_seedqr(self) -> bool:
         return self.qr_type == QRType.SEED__ENCRYPTEDQR
 
+    @property
+    def is_ambiguous_seedqr(self) -> bool:
+        return self.qr_type == QRType.SEED__AMBIGUOUS
+
 
     @staticmethod
     def extract_qr_data(image, is_binary:bool = False) -> str | None:
@@ -434,6 +462,98 @@ class DecodeQR:
         for barcode in barcodes:
             # Only pull and return the first barcode
             return barcode.data
+
+
+    @staticmethod
+    def _get_ambiguous_seed_preference() -> str:
+        from seedsigner.models.settings import Settings
+        return Settings.get_instance().get_value(SettingsConstants.SETTING__AMBIGUOUS_SEED_QR)
+
+
+    @staticmethod
+    def _store_encrypted_qr_candidate(encrypted_qr, public_data: str) -> None:
+        from seedsigner.models.encryptedqr import EncryptedQR
+        from seedsigner.controller import Controller
+
+        Controller.get_instance().storage2.set_encryptedqr(
+            EncryptedQR(encrypted_qr=encrypted_qr, public_data=public_data)
+        )
+
+
+    @staticmethod
+    def analyze_seed_payload(segment: bytes) -> SeedPayloadAnalysis:
+        candidate_types: list[str] = []
+
+        if len(segment) in (16, 20, 24, 28, 32):
+            candidate_types.append(QRType.SEED__COMPACTSEEDQR)
+
+        encrypted_qr, public_data = DecodeQR._parse_encrypted_qr(segment)
+        if public_data:
+            candidate_types.append(QRType.SEED__ENCRYPTEDQR)
+
+        try:
+            text = segment.decode("utf-8").strip()
+        except Exception:
+            text = None
+
+        if text:
+            try:
+                hdkey = bip32.HDKey.from_string(text)
+                if hdkey.is_private:
+                    candidate_types.append(QRType.SEED__XPRV)
+            except Exception:
+                pass
+
+        return SeedPayloadAnalysis(
+            segment=segment,
+            candidate_types=candidate_types,
+            public_data=public_data,
+            encrypted_qr=encrypted_qr,
+        )
+
+
+    @staticmethod
+    def _parse_encrypted_qr(segment: bytes):
+        from seedsigner.models.encryption import EncryptedQRCode
+        from seedsigner.helpers.base43 import base43_decode
+
+        encrypted_qr = EncryptedQRCode()
+        try:
+            segment_text = segment.decode("utf-8")
+            data_bytes = base43_decode(segment_text)
+            public_data = encrypted_qr.public_data(data_bytes)
+            if public_data:
+                return encrypted_qr, public_data
+        except Exception:
+            pass
+
+        try:
+            public_data = encrypted_qr.public_data(segment)
+            if public_data:
+                return encrypted_qr, public_data
+        except Exception:
+            pass
+
+        return None, None
+
+
+    @staticmethod
+    def resolve_seed_payload_type(analysis: SeedPayloadAnalysis) -> str | None:
+        if not analysis.candidate_types:
+            return None
+
+        if len(analysis.candidate_types) == 1:
+            return analysis.candidate_types[0]
+
+        preference = DecodeQR._get_ambiguous_seed_preference()
+        if preference == SettingsConstants.AMBIGUOUS_SEED_QR__COMPACT and QRType.SEED__COMPACTSEEDQR in analysis.candidate_types:
+            return QRType.SEED__COMPACTSEEDQR
+        if preference == SettingsConstants.AMBIGUOUS_SEED_QR__ENCRYPTED and QRType.SEED__ENCRYPTEDQR in analysis.candidate_types:
+            return QRType.SEED__ENCRYPTEDQR
+        if preference == SettingsConstants.AMBIGUOUS_SEED_QR__PROMPT:
+            return QRType.SEED__AMBIGUOUS
+
+        return QRType.SEED__AMBIGUOUS
 
 
     @staticmethod
@@ -566,44 +686,12 @@ class DecodeQR:
                 # Couldn't convert back to bytes; shouldn't happen
                 raise Exception("Conversion to bytes failed")
 
-        # Byte lengths for CompactSeedQR entropy:
-        #   32 bytes for 24-word
-        #   28 bytes for 21-word
-        #   24 bytes for 18-word
-        #   20 bytes for 15-word
-        #   16 bytes for 12-word
-        if len(s) in (16, 20, 24, 28, 32):
-            try:
-                bitstream = ""
-                for b in s:
-                    bitstream += bin(b).lstrip('0b').zfill(8)
-                # print(bitstream)
-
-                return QRType.SEED__COMPACTSEEDQR
-            except Exception as e:
-                # Couldn't extract byte data; assume it's not a byte format
-                pass
-
-        else:
-            from seedsigner.models.encryption import EncryptedQRCode
-            from seedsigner.helpers.base43 import base43_decode
-            encrypted_qr = EncryptedQRCode()
-            public_data = None
-            try:  # Try to decode base43 data
-                if isinstance(s, bytes):
-                    s = s.decode('utf-8')
-                data_bytes = base43_decode(s)
-                public_data = encrypted_qr.public_data(data_bytes)
-            except:
-                pass
-            if not public_data:  # Failed to decode and parse base43
-                public_data = encrypted_qr.public_data(s)
-            if public_data:
-                from seedsigner.models.encryptedqr import EncryptedQR
-                encryptedqr = EncryptedQR(encrypted_qr=encrypted_qr, public_data=public_data)
-                from seedsigner.controller import Controller
-                Controller.get_instance().storage2.set_encryptedqr(encryptedqr)
-                return QRType.SEED__ENCRYPTEDQR
+        analysis = DecodeQR.analyze_seed_payload(s)
+        resolved_qr_type = DecodeQR.resolve_seed_payload_type(analysis)
+        if resolved_qr_type == QRType.SEED__ENCRYPTEDQR and analysis.encrypted_qr:
+            DecodeQR._store_encrypted_qr_candidate(analysis.encrypted_qr, analysis.public_data)
+        if resolved_qr_type:
+            return resolved_qr_type
 
         return QRType.INVALID
 
@@ -1081,6 +1169,37 @@ class XprvQrDecoder(BaseSingleFrameQrDecoder):
         return self.xprv
 
 
+class AmbiguousSeedQrDecoder(BaseSingleFrameQrDecoder):
+    def __init__(self):
+        super().__init__()
+        self.segment = None
+        self.candidate_types = []
+        self.public_data = None
+
+    def add(self, segment, qr_type=QRType.SEED__AMBIGUOUS):
+        if qr_type != QRType.SEED__AMBIGUOUS:
+            return DecodeQRStatus.INVALID
+
+        analysis = DecodeQR.analyze_seed_payload(segment)
+        if len(analysis.candidate_types) < 2:
+            return DecodeQRStatus.INVALID
+
+        self.segment = segment
+        self.candidate_types = analysis.candidate_types
+        self.public_data = analysis.public_data
+        self.complete = True
+        self.collected_segments = 1
+        return DecodeQRStatus.COMPLETE
+
+    def get_segment(self):
+        return self.segment
+
+    def get_candidate_types(self):
+        return self.candidate_types[:]
+
+    def get_public_data(self):
+        return self.public_data
+
 
 class SettingsQrDecoder(BaseSingleFrameQrDecoder):
     """
@@ -1434,13 +1553,12 @@ class Bip38QrDecoder(BaseSingleFrameQrDecoder):
 
 class EncryptedQrDecoder(BaseSingleFrameQrDecoder):
     """
-        Decodes single frame representing an encypted seed.
+        Decodes single frame representing an encrypted seed payload and stores
+        parsed metadata for subsequent decrypt flow handling.
     """
     def __init__(self):
         super().__init__()
         self.public_data = None
-        self.seed_phrase = []
-        self.xprv = None
 
 
     def add(self, segment, qr_type=QRType.SEED__ENCRYPTEDQR, encryption_key=None):
@@ -1453,42 +1571,12 @@ class EncryptedQrDecoder(BaseSingleFrameQrDecoder):
                     encrypted_qr = encryptedqr.encrypted_qr
                     self.public_data = encryptedqr.public_data
                 else:
-                    from seedsigner.models.encryption import EncryptedQRCode
-                    from seedsigner.helpers.base43 import base43_decode
-                    encrypted_qr = EncryptedQRCode()
-                    self.public_data = None
-                    try:  # Try to decode base43 data
-                        if isinstance(segment, bytes):
-                            segment = segment.decode('utf-8')
-                        data_bytes = base43_decode(segment)
-                        self.public_data = encrypted_qr.public_data(data_bytes)
-                    except:
-                        pass
-                    if not self.public_data:  # Failed to decode and parse base43
-                        self.public_data = encrypted_qr.public_data(segment)
-                    if not self.public_data:
-                        raise Exception("Encrypted QR code is invalid.")
-                    from seedsigner.models.encryptedqr import EncryptedQR
-                    encryptedqr = EncryptedQR(encrypted_qr=encrypted_qr, public_data=self.public_data)
-                    controller.storage2.set_encryptedqr(encryptedqr)
+                    segment_bytes = segment if isinstance(segment, bytes) else segment.encode("utf-8")
+                    encrypted_qr, self.public_data = DecodeQR._parse_encrypted_qr(segment_bytes)
 
-                if encryption_key:
-                    word_bytes = encrypted_qr.decrypt(encryption_key)
-                    if not word_bytes:
-                        return DecodeQRStatus.WRONG_KEY
-                    try:
-                        self.seed_phrase = bip39.mnemonic_from_bytes(word_bytes).split()
-                        self.xprv = None
-                    except Exception:
-                        candidate = word_bytes.decode("utf-8", errors="ignore").strip()
-                        hdkey = bip32.HDKey.from_string(candidate)
-                        if not hdkey.is_private:
-                            return DecodeQRStatus.INVALID
-                        self.seed_phrase = []
-                        self.xprv = candidate
-                else:
-                    self.seed_phrase = []
-                    self.xprv = None
+                    if not encrypted_qr or not self.public_data:
+                        raise Exception("Encrypted QR code is invalid.")
+                    DecodeQR._store_encrypted_qr_candidate(encrypted_qr, self.public_data)
 
                 self.complete = True
                 self.collected_segments = 1
@@ -1502,13 +1590,6 @@ class EncryptedQrDecoder(BaseSingleFrameQrDecoder):
 
     def get_public_data(self):
         return self.public_data
-
-
-    def get_seed_phrase(self):
-        return self.seed_phrase[:]
-
-    def get_xprv(self):
-        return self.xprv
 
 
 
