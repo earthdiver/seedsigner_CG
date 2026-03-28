@@ -1,55 +1,44 @@
 from base import BaseTest, FlowStep, FlowTest
 
-from seedsigner.helpers import kef
 from seedsigner.gui.screens.screen import ButtonOption
 from seedsigner.models.decode_qr import DecodeQR, SeedPayloadAnalysis
 from seedsigner.models.qr_type import QRType
 from seedsigner.models.settings_definition import SettingsConstants
 from seedsigner.views import scan_views
-from seedsigner.views.view import MainMenuView
+from seedsigner.views.view import Destination, MainMenuView
 
-from test_encryption_vectors import ECB_ENCRYPTED_QR
-
-
-OUTER_KEY = "outer key"
-OUTER_ID = b"outer id"
-OUTER_VERSION = 5
-OUTER_ITERATIONS = 100000
 
 AMBIGUOUS_SEGMENT = bytes([0] * 32)
+ENCRYPTED_PUBLIC_DATA = "Encrypted QR Code:\nID: test"
 
 
 class FakeEncryptedQR:
-    def __init__(self, decrypted_payload: bytes = AMBIGUOUS_SEGMENT):
-        self.decrypted_payload = decrypted_payload
-
     def decrypt(self, _encryption_key: str):
-        return self.decrypted_payload
+        return AMBIGUOUS_SEGMENT
 
 
-def ambiguous_analysis(segment: bytes) -> SeedPayloadAnalysis:
+def make_ambiguous_analysis(segment: bytes) -> SeedPayloadAnalysis:
     return SeedPayloadAnalysis(
         segment=segment,
         candidate_types=[QRType.SEED__COMPACTSEEDQR, QRType.SEED__ENCRYPTEDQR],
-        public_data="Encrypted QR Code:\nID: test",
+        public_data=ENCRYPTED_PUBLIC_DATA,
         encrypted_qr=FakeEncryptedQR(),
     )
 
 
-def build_nested_encrypted_qr(inner_payload: bytes) -> bytes:
-    cipher = kef.Cipher(OUTER_KEY, OUTER_ID, OUTER_ITERATIONS)
-    encrypted_payload = cipher.encrypt(inner_payload, OUTER_VERSION)
-    return kef.wrap(OUTER_ID, OUTER_VERSION, OUTER_ITERATIONS, encrypted_payload)
-
-
-class TestSeedQRAmbiguity(BaseTest):
-    def test_detect_segment_type_prefers_compactseedqr_by_default(self, monkeypatch):
+class TestSeedQRAmbiguityDetection(BaseTest):
+    def test_detect_segment_type_prefers_compact_when_setting_is_compact(self, monkeypatch):
         self.settings.set_value(
             SettingsConstants.SETTING__AMBIGUOUS_SEED_QR,
             SettingsConstants.AMBIGUOUS_SEED_QR__COMPACT,
             save=False,
         )
-        monkeypatch.setattr(DecodeQR, "analyze_seed_payload", staticmethod(ambiguous_analysis))
+        monkeypatch.setattr(
+            DecodeQR,
+            "_parse_encrypted_qr",
+            staticmethod(lambda _segment: (FakeEncryptedQR(), ENCRYPTED_PUBLIC_DATA)),
+        )
+
         decoder = DecodeQR()
 
         assert (
@@ -60,13 +49,18 @@ class TestSeedQRAmbiguity(BaseTest):
             == QRType.SEED__COMPACTSEEDQR
         )
 
-    def test_detect_segment_type_prompts_for_ambiguous_seed_qr(self, monkeypatch):
+    def test_detect_segment_type_returns_ambiguous_when_setting_is_prompt(self, monkeypatch):
         self.settings.set_value(
             SettingsConstants.SETTING__AMBIGUOUS_SEED_QR,
             SettingsConstants.AMBIGUOUS_SEED_QR__PROMPT,
             save=False,
         )
-        monkeypatch.setattr(DecodeQR, "analyze_seed_payload", staticmethod(ambiguous_analysis))
+        monkeypatch.setattr(
+            DecodeQR,
+            "_parse_encrypted_qr",
+            staticmethod(lambda _segment: (FakeEncryptedQR(), ENCRYPTED_PUBLIC_DATA)),
+        )
+
         decoder = DecodeQR()
 
         assert (
@@ -77,22 +71,51 @@ class TestSeedQRAmbiguity(BaseTest):
             == QRType.SEED__AMBIGUOUS
         )
 
+    def test_detect_segment_type_prefers_encrypted_and_stores_candidate(self, monkeypatch):
+        self.settings.set_value(
+            SettingsConstants.SETTING__AMBIGUOUS_SEED_QR,
+            SettingsConstants.AMBIGUOUS_SEED_QR__ENCRYPTED,
+            save=False,
+        )
+        fake_encrypted_qr = FakeEncryptedQR()
+        monkeypatch.setattr(
+            DecodeQR,
+            "_parse_encrypted_qr",
+            staticmethod(lambda _segment: (fake_encrypted_qr, ENCRYPTED_PUBLIC_DATA)),
+        )
+
+        decoder = DecodeQR()
+        qr_type = decoder.detect_segment_type(
+            AMBIGUOUS_SEGMENT,
+            wordlist_language_code=SettingsConstants.WORDLIST_LANGUAGE__ENGLISH,
+        )
+
+        assert qr_type == QRType.SEED__ENCRYPTEDQR
+        stored = self.controller.storage2.encryptedqr
+        assert stored is not None
+        assert stored.encrypted_qr is fake_encrypted_qr
+        assert stored.public_data == ENCRYPTED_PUBLIC_DATA
+
 
 class TestSeedQRAmbiguityFlows(FlowTest):
-    def test_scan_ambiguous_seed_qr_can_be_routed_to_encrypted_flow(self, monkeypatch):
+    def test_scan_ambiguous_seed_qr_can_route_to_encrypted_key_view(self, monkeypatch):
         self.settings.set_value(
             SettingsConstants.SETTING__AMBIGUOUS_SEED_QR,
             SettingsConstants.AMBIGUOUS_SEED_QR__PROMPT,
             save=False,
         )
-        monkeypatch.setattr(DecodeQR, "analyze_seed_payload", staticmethod(ambiguous_analysis))
+        monkeypatch.setattr(
+            DecodeQR,
+            "analyze_seed_payload",
+            staticmethod(make_ambiguous_analysis),
+        )
 
-        def load_ambiguous_encrypted_qr(view: scan_views.ScanView):
+        def load_ambiguous_segment(view: scan_views.ScanView):
             view.decoder.add_data(AMBIGUOUS_SEGMENT)
 
         self.run_sequence([
             FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
-            FlowStep(scan_views.ScanView, before_run=load_ambiguous_encrypted_qr),
+            FlowStep(scan_views.ScanView, before_run=load_ambiguous_segment),
             FlowStep(
                 scan_views.ScanAmbiguousSeedQRPromptView,
                 button_data_selection=scan_views.ScanAmbiguousSeedQRPromptView.ENCRYPTED,
@@ -104,35 +127,26 @@ class TestSeedQRAmbiguityFlows(FlowTest):
             FlowStep(MainMenuView),
         ])
 
-    def test_nested_encrypted_qr_prompts_before_redecrypting(self, monkeypatch):
+    def test_decrypt_route_returns_prompt_for_nested_ambiguous_payload(self, monkeypatch):
         self.settings.set_value(
             SettingsConstants.SETTING__AMBIGUOUS_SEED_QR,
             SettingsConstants.AMBIGUOUS_SEED_QR__PROMPT,
             save=False,
         )
-        nested_payload = build_nested_encrypted_qr(ECB_ENCRYPTED_QR)
-        monkeypatch.setattr(DecodeQR, "analyze_seed_payload", staticmethod(ambiguous_analysis))
         monkeypatch.setattr(
             DecodeQR,
-            "_parse_encrypted_qr",
-            staticmethod(lambda _segment: (FakeEncryptedQR(AMBIGUOUS_SEGMENT), "Encrypted QR Code:\nID: test")),
+            "analyze_seed_payload",
+            staticmethod(make_ambiguous_analysis),
         )
 
-        self.run_sequence(
-            [
-                FlowStep(scan_views.ScanDecryptEncryptedQRView, is_redirect=True),
-                FlowStep(
-                    scan_views.ScanAmbiguousSeedQRPromptView,
-                    button_data_selection=scan_views.ScanAmbiguousSeedQRPromptView.ENCRYPTED,
-                ),
-                FlowStep(
-                    scan_views.ScanEncryptedQREncryptionKeyView,
-                    button_data_selection=ButtonOption("Cancel"),
-                ),
-                FlowStep(MainMenuView),
-            ],
-            initial_destination_view_args={
-                "encryption_key": OUTER_KEY,
-                "encrypted_data": nested_payload,
-            },
-        )
+        view = scan_views.ScanDecryptEncryptedQRView(encryption_key="outer key", encrypted_data=b"unused")
+        destination = view._route_decrypted_payload(AMBIGUOUS_SEGMENT)
+
+        assert isinstance(destination, Destination)
+        assert destination.View_cls == scan_views.ScanAmbiguousSeedQRPromptView
+        assert destination.view_args["segment"] == AMBIGUOUS_SEGMENT
+        assert destination.view_args["candidate_types"] == [
+            QRType.SEED__COMPACTSEEDQR,
+            QRType.SEED__ENCRYPTEDQR,
+        ]
+        assert destination.view_args["public_data"] == ENCRYPTED_PUBLIC_DATA
