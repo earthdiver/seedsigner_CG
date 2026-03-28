@@ -1,6 +1,7 @@
 from base import BaseTest, FlowStep, FlowTest
 
 from seedsigner.helpers import kef
+from seedsigner.gui.screens.screen import ButtonOption
 from seedsigner.models.decode_qr import DecodeQR, SeedPayloadAnalysis
 from seedsigner.models.qr_type import QRType
 from seedsigner.models.settings_definition import SettingsConstants
@@ -33,7 +34,13 @@ class TestSeedQRAmbiguity(BaseTest):
         )
         decoder = DecodeQR()
 
-        assert decoder.detect_segment_type(AMBIGUOUS_SEGMENT) == QRType.SEED__COMPACTSEEDQR
+        assert (
+            decoder.detect_segment_type(
+                AMBIGUOUS_SEGMENT,
+                wordlist_language_code=SettingsConstants.WORDLIST_LANGUAGE__ENGLISH,
+            )
+            == QRType.SEED__COMPACTSEEDQR
+        )
 
     def test_detect_segment_type_prompts_for_ambiguous_seed_qr(self, monkeypatch):
         monkeypatch.setattr(
@@ -48,7 +55,13 @@ class TestSeedQRAmbiguity(BaseTest):
         )
         decoder = DecodeQR()
 
-        assert decoder.detect_segment_type(AMBIGUOUS_SEGMENT) == QRType.SEED__AMBIGUOUS
+        assert (
+            decoder.detect_segment_type(
+                AMBIGUOUS_SEGMENT,
+                wordlist_language_code=SettingsConstants.WORDLIST_LANGUAGE__ENGLISH,
+            )
+            == QRType.SEED__AMBIGUOUS
+        )
 
 
 class TestSeedQRAmbiguityFlows(FlowTest):
@@ -74,7 +87,11 @@ class TestSeedQRAmbiguityFlows(FlowTest):
                 scan_views.ScanAmbiguousSeedQRPromptView,
                 button_data_selection=scan_views.ScanAmbiguousSeedQRPromptView.ENCRYPTED,
             ),
-            FlowStep(scan_views.ScanEncryptedQREncryptionKeyView),
+            FlowStep(
+                scan_views.ScanEncryptedQREncryptionKeyView,
+                button_data_selection=ButtonOption("Cancel"),
+            ),
+            FlowStep(MainMenuView),
         ])
 
     def test_nested_encrypted_qr_prompts_before_redecrypting(self, monkeypatch):
@@ -109,7 +126,11 @@ class TestSeedQRAmbiguityFlows(FlowTest):
                     scan_views.ScanAmbiguousSeedQRPromptView,
                     button_data_selection=scan_views.ScanAmbiguousSeedQRPromptView.ENCRYPTED,
                 ),
-                FlowStep(scan_views.ScanEncryptedQREncryptionKeyView),
+                FlowStep(
+                    scan_views.ScanEncryptedQREncryptionKeyView,
+                    button_data_selection=ButtonOption("Cancel"),
+                ),
+                FlowStep(MainMenuView),
             ],
             initial_destination_view_args={
                 "encryption_key": OUTER_KEY,
