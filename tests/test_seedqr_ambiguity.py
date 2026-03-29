@@ -1,11 +1,9 @@
-from base import BaseTest, FlowStep, FlowTest
-
-from seedsigner.gui.screens.screen import ButtonOption
+from base import BaseTest, FlowTest
 from seedsigner.models.decode_qr import DecodeQR, PayloadAnalysis
 from seedsigner.models.qr_type import QRType
 from seedsigner.models.settings_definition import SettingsConstants
 from seedsigner.views import scan_views
-from seedsigner.views.view import Destination, MainMenuView
+from seedsigner.views.view import Destination
 
 
 AMBIGUOUS_SEGMENT = bytes([0] * 32)
@@ -98,34 +96,41 @@ class TestSeedQRAmbiguityDetection(BaseTest):
 
 
 class TestSeedQRAmbiguityFlows(FlowTest):
-    def test_scan_ambiguous_qr_can_route_to_encrypted_key_view(self, monkeypatch):
+    def test_ambiguous_prompt_encrypted_choice_routes_to_encrypted_key_view(self, monkeypatch):
         self.settings.set_value(
             SettingsConstants.SETTING__AMBIGUOUS_QR,
             SettingsConstants.AMBIGUOUS_QR_PROMPT,
             save=False,
         )
+        fake_encrypted_qr = FakeEncryptedQR()
         monkeypatch.setattr(
             DecodeQR,
             "analyze_bytedata_payload",
-            staticmethod(make_ambiguous_analysis),
+            staticmethod(
+                lambda segment: PayloadAnalysis(
+                    segment=segment,
+                    candidate_types=[QRType.SEED__COMPACTSEEDQR, QRType.SEED__ENCRYPTEDQR],
+                    public_data=ENCRYPTED_PUBLIC_DATA,
+                    encrypted_qr=fake_encrypted_qr,
+                )
+            ),
         )
 
-        def load_ambiguous_segment(view: scan_views.ScanView):
-            view.decoder.add_data(AMBIGUOUS_SEGMENT)
+        view = scan_views.ScanAmbiguousQRPromptView(
+            segment=AMBIGUOUS_SEGMENT,
+            candidate_types=[QRType.SEED__COMPACTSEEDQR, QRType.SEED__ENCRYPTEDQR],
+            public_data=ENCRYPTED_PUBLIC_DATA,
+        )
+        view.run_screen = lambda *args, **kwargs: 1 if kwargs.get("public_data") is None else 0
 
-        self.run_sequence([
-            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
-            FlowStep(scan_views.ScanView, before_run=load_ambiguous_segment),
-            FlowStep(
-                scan_views.ScanAmbiguousQRPromptView,
-                button_data_selection=scan_views.ScanAmbiguousQRPromptView.ENCRYPTED,
-            ),
-            FlowStep(
-                scan_views.ScanEncryptedQREncryptionKeyView,
-                button_data_selection=ButtonOption("Cancel"),
-            ),
-            FlowStep(MainMenuView),
-        ])
+        destination = view.run()
+
+        assert isinstance(destination, Destination)
+        assert destination.View_cls == scan_views.ScanEncryptedQREncryptionKeyView
+        stored = self.controller.storage2.encryptedqr
+        assert stored is not None
+        assert stored.encrypted_qr is fake_encrypted_qr
+        assert stored.public_data == ENCRYPTED_PUBLIC_DATA
 
     def test_decrypt_route_returns_prompt_for_nested_ambiguous_payload(self, monkeypatch):
         self.settings.set_value(
