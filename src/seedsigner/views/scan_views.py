@@ -839,6 +839,18 @@ class ScanDecryptEncryptedQRView(View):
                 skip_current_view=True,
             )
 
+        try:
+            decoded_text = word_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            decoded_text = None
+
+        if decoded_text and decoded_text.isprintable():
+            return Destination(
+                ScanDecryptedAsciiTextView,
+                view_args=dict(text=decoded_text),
+                skip_current_view=True,
+            )
+
         return Destination(ScanInvalidQRTypeView)
 
 
@@ -902,6 +914,27 @@ class ScanInvalidQRTypeView(View):
             status_headline=_("Unknown QR Type"),
             text=_("QRCode is invalid or is a data format not yet supported."),
             button_data=[ButtonOption("Done")],
+        )
+
+        return Destination(MainMenuView, clear_history=True)
+
+
+class ScanDecryptedAsciiTextView(View):
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        from seedsigner.gui.screens.tools_screens import ToolsTextQRReviewTextScreen
+
+        DONE = ButtonOption("Done")
+
+        self.run_screen(
+            ToolsTextQRReviewTextScreen,
+            title=_("Decrypted Text"),
+            textToEncode=self.text,
+            button_data=[DONE],
+            show_back_button=False,
         )
 
         return Destination(MainMenuView, clear_history=True)
